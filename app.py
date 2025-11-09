@@ -1,56 +1,45 @@
+# demo_app.py
+import streamlit as st
+import torch
+import numpy as np
+from PIL import Image
+import os
 
-import argparse
-import matplotlib.pyplot as plt
+from models import UNetGenerator
+from colorizers.util import preprocess_img, postprocess_tens
 
-from colorizers import *
+st.set_page_config(page_title="Historical Image Colorization", layout="wide")
+st.title("AI-Powered Historical Image Colorization")
 
-parser = argparse.ArgumentParser()
-parser.add_argument('-i','--img_path', type=str, default='imgs/ansel_adams3.jpg')
-parser.add_argument('--use_gpu', action='store_true', help='whether to use GPU')
-parser.add_argument('-o','--save_prefix', type=str, default='saved', help='will save into this file with {eccv16.png, siggraph17.png} suffixes')
-opt = parser.parse_args()
+uploaded = st.file_uploader("Upload a black-and-white image", type=["jpg","png","jpeg"])
+checkpoint = st.text_input("Path to generator checkpoint (.pth)", value="checkpoints/g_best.pth")
+use_gpu = st.checkbox("Use GPU if available", value=False)
 
-# load colorizers
-colorizer_eccv16 = eccv16(pretrained=True).eval()
-colorizer_siggraph17 = siggraph17(pretrained=True).eval()
-if(opt.use_gpu):
-	colorizer_eccv16.cuda()
-	colorizer_siggraph17.cuda()
+if uploaded:
+    img = Image.open(uploaded).convert("RGB")
+    st.image(img, caption="Uploaded image", use_column_width=True)
 
-# default size to process images is 256x256
-# grab L channel in both original ("orig") and resized ("rs") resolutions
-img = load_img(opt.img_path)
-(tens_l_orig, tens_l_rs) = preprocess_img(img, HW=(256,256))
-if(opt.use_gpu):
-	tens_l_rs = tens_l_rs.cuda()
+    device = torch.device('cuda' if (use_gpu and torch.cuda.is_available()) else 'cpu')
+    st.write("Device:", device)
 
-# colorizer outputs 256x256 ab map
-# resize and concatenate to original L channel
-img_bw = postprocess_tens(tens_l_orig, torch.cat((0*tens_l_orig,0*tens_l_orig),dim=1))
-out_img_eccv16 = postprocess_tens(tens_l_orig, colorizer_eccv16(tens_l_rs).cpu())
-out_img_siggraph17 = postprocess_tens(tens_l_orig, colorizer_siggraph17(tens_l_rs).cpu())
+    if os.path.exists(checkpoint):
+        G = UNetGenerator().to(device)
+        G.load_state_dict(torch.load(checkpoint, map_location=device))
+        G.eval()
 
-plt.imsave('%s_eccv16.png'%opt.save_prefix, out_img_eccv16)
-plt.imsave('%s_siggraph17.png'%opt.save_prefix, out_img_siggraph17)
+        L_orig, L_rs = preprocess_img(img, HW=(256,256))
+        if device.type == 'cuda':
+            L_rs = L_rs.cuda()
 
-plt.figure(figsize=(12,8))
-plt.subplot(2,2,1)
-plt.imshow(img)
-plt.title('Original')
-plt.axis('off')
+        with torch.no_grad():
+            ab_pred = G(L_rs)
+            out = postprocess_tens(L_orig, ab_pred.cpu())
+        st.image((out*255).astype('uint8'), caption="Colorized", use_column_width=True)
 
-plt.subplot(2,2,2)
-plt.imshow(img_bw)
-plt.title('Input')
-plt.axis('off')
-
-plt.subplot(2,2,3)
-plt.imshow(out_img_eccv16)
-plt.title('Output (ECCV 16)')
-plt.axis('off')
-
-plt.subplot(2,2,4)
-plt.imshow(out_img_siggraph17)
-plt.title('Output (SIGGRAPH 17)')
-plt.axis('off')
-plt.show()
+        # provide download
+        out_img = Image.fromarray((out*255).astype('uint8'))
+        buf = st.download_button("Download colorized image", data=out_img.tobytes(), file_name="colorized.png")
+    else:
+        st.warning(f"Checkpoint not found at {checkpoint}. Train the model or provide checkpoint path.")
+else:
+    st.info("Upload an image to colorize.")
