@@ -1,7 +1,8 @@
 torch
-skikit-image
+torchvision
+opencv-python
 numpy
 matplotlib
-argparse
-PIL
-Ipython
+Pillow
+streamlit
+tqdm
