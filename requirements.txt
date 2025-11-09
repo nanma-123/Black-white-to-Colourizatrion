@@ -1,0 +1,7 @@
+torch
+skikit-image
+numpy
+matplotlib
+argparse
+PIL
+Ipython
