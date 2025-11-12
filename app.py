@@ -19,13 +19,9 @@ st.write("Upload a historical black-and-white photograph and watch it come to li
 # Helper: Ensure checkpoint exists
 # -------------------------------------------------------
 def ensure_checkpoint():
-    os.makedirs("checkpoints", exist_ok=True)
     ckpt_path = "checkpoints/g_best.pth"
     if not os.path.exists(ckpt_path):
-        st.info("Downloading pretrained model (~100 MB)... Please wait.")
-        url = "https://people.eecs.berkeley.edu/~rich.zhang/projects/2016_colorization/files/demo_release/colorization_release_v2-9b330a0b.pth"
-        urllib.request.urlretrieve(url, ckpt_path)
-        st.success("✅ Model downloaded successfully!")
+        st.error("Model file missing! Upload checkpoints/g_best.pth to the repository.")
     return ckpt_path
 
 checkpoint = ensure_checkpoint()
