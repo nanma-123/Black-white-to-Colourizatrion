@@ -4,6 +4,7 @@ opencv-python-headless
 numpy
 matplotlib
 Pillow
-streamlit
+scikit-image
 tqdm
-
+streamlit
+scipy
