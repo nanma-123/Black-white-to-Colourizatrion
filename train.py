@@ -1,147 +1,97 @@
 # train.py
 import os
-import random
-from tqdm import tqdm
-import numpy as np
-from PIL import Image
-
 import torch
+from torch.utils.data import DataLoader
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-import torchvision.transforms as T
-from torchvision.utils import save_image
-
+import torch.optim as optim
+from dataset import PairedImageDataset
 from models import UNetGenerator, PatchDiscriminator
-from colorizers.util import load_img
+from torchvision.utils import save_image
+from tqdm import tqdm
 
-# ---- Dataset ----
-class PairedColorDataset(Dataset):
-    def __init__(self, root_dir, split='train', img_size=256, augment=True):
-        self.gray_dir = os.path.join(root_dir, f"{split}_black")
-        self.color_dir = os.path.join(root_dir, f"{split}_colour")
-        self.files = sorted(os.listdir(self.color_dir))
-        self.augment = augment and split=='train'
-        self.img_size = img_size
-        self.to_tensor = T.Compose([T.Resize((img_size,img_size)), T.ToTensor()])
-        self.normalize = T.Normalize(mean=[0.5]*3, std=[0.5]*3)
+def weights_init(m):
+    classname = m.__class__.__name__
+    if classname.find('Conv') != -1:
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif classname.find('BatchNorm') != -1:
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
 
-    def __len__(self):
-        return len(self.files)
+def train(root='Data', epochs=100, batch_size=8, image_size=256, lr=2e-4, device='cuda'):
+    device = torch.device(device if torch.cuda.is_available() else 'cpu')
+    dataset = PairedImageDataset(root, split='train', image_size=image_size)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
-    def __getitem__(self, idx):
-        fname = self.files[idx]
-        gray_path = os.path.join(self.gray_dir, fname)
-        color_path = os.path.join(self.color_dir, fname)
-        if not os.path.exists(gray_path):
-            color_img = Image.open(color_path).convert('RGB')
-            gray_img = color_img.convert('L').convert('RGB')
-        else:
-            gray_img = Image.open(gray_path).convert('RGB')
-            color_img = Image.open(color_path).convert('RGB')
+    G = UNetGenerator(in_channels=1, out_channels=3).to(device)
+    D = PatchDiscriminator(in_channels=4).to(device)
+    G.apply(weights_init)
+    D.apply(weights_init)
 
-        if self.augment and random.random() < 0.5:
-            gray_img = T.functional.hflip(gray_img)
-            color_img = T.functional.hflip(color_img)
+    # Losses
+    adversarial_loss = nn.BCEWithLogitsLoss().to(device)
+    l1_loss = nn.L1Loss().to(device)
 
-        gray_t = self.to_tensor(gray_img)
-        color_t = self.to_tensor(color_img)
+    opt_G = optim.Adam(G.parameters(), lr=lr, betas=(0.5, 0.999))
+    opt_D = optim.Adam(D.parameters(), lr=lr, betas=(0.5, 0.999))
 
-        gray_single = T.functional.rgb_to_grayscale(gray_t, num_output_channels=1)
-        gray_rep = gray_single.repeat(3,1,1)
+    sample_dir = 'samples'
+    os.makedirs(sample_dir, exist_ok=True)
+    ckpt_dir = 'checkpoints'
+    os.makedirs(ckpt_dir, exist_ok=True)
 
-        gray_rep = self.normalize(gray_rep)
-        color_t = self.normalize(color_t)
-
-        return {'gray': gray_rep, 'color': color_t, 'fname': fname}
-
-# ---- helpers ----
-def tensor_to_np_img(tensor):
-    img = tensor.detach().cpu().float()
-    img = (img + 1) / 2.0
-    img = img.numpy().transpose(1,2,0)
-    img = np.clip(img*255.0, 0, 255).astype(np.uint8)
-    return img
-
-# ---- train loop ----
-def train(data_dir, epochs=30, batch_size=8, img_size=256, lr=2e-4, out_dir='checkpoints'):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    train_ds = PairedColorDataset(data_dir, split='train', img_size=img_size, augment=True)
-    val_ds = PairedColorDataset(data_dir, split='test', img_size=img_size, augment=False)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2)
-
-    G = UNetGenerator().to(device)
-    D = PatchDiscriminator().to(device)
-
-    opt_G = torch.optim.Adam(G.parameters(), lr=lr, betas=(0.5,0.999))
-    opt_D = torch.optim.Adam(D.parameters(), lr=lr, betas=(0.5,0.999))
-
-    adv_loss = nn.MSELoss()
-    l1_loss = nn.L1Loss()
-
-    os.makedirs(out_dir, exist_ok=True)
-
-    best_psnr = 0.0
     for epoch in range(1, epochs+1):
-        G.train(); D.train()
-        loop = tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}")
-        for batch in loop:
-            gray = batch['gray'].to(device)
-            real_color = batch['color'].to(device)
+        pbar = tqdm(loader, desc=f"Epoch {epoch}/{epochs}")
+        for i, (black, color) in enumerate(pbar):
+            black = black.to(device)          # (B,1,H,W)
+            color = color.to(device)          # (B,3,H,W)
 
-            # Train D
-            opt_D.zero_grad()
-            real_in = torch.cat([gray, real_color], dim=1)
-            out_real = D(real_in)
-            real_label = torch.ones_like(out_real).to(device)
-            loss_D_real = adv_loss(out_real, real_label)
+            # Ground truths
+            valid = torch.ones((black.size(0),1,30,30), device=device)  # patch size depends on image_size; 256 -> about 30
+            fake_label = torch.zeros_like(valid)
 
-            fake_color = G(gray)
-            fake_in = torch.cat([gray, fake_color.detach()], dim=1)
-            out_fake = D(fake_in)
-            fake_label = torch.zeros_like(out_fake).to(device)
-            loss_D_fake = adv_loss(out_fake, fake_label)
-
-            loss_D = 0.5 * (loss_D_real + loss_D_fake)
-            loss_D.backward()
-            opt_D.step()
-
-            # Train G
+            # -------------
+            # Train Generator (G)
+            # -------------
             opt_G.zero_grad()
-            gen_in = torch.cat([gray, fake_color], dim=1)
-            out_gen = D(gen_in)
-            loss_G_adv = adv_loss(out_gen, real_label)
-            loss_G_l1 = l1_loss(fake_color, real_color) * 100.0
-            loss_G = loss_G_adv + loss_G_l1
-            loss_G.backward()
+            fake_color = G(black)
+            # discriminator on concatenated input
+            pred_fake = D(torch.cat([black, fake_color], dim=1))
+            g_adv = adversarial_loss(pred_fake, valid)
+            g_l1 = l1_loss(fake_color, color) * 100.0  # lambda L1
+            g_loss = g_adv + g_l1
+            g_loss.backward()
             opt_G.step()
 
-            loop.set_postfix(loss_D=loss_D.item(), loss_G=loss_G.item())
+            # -------------
+            # Train Discriminator (D)
+            # -------------
+            opt_D.zero_grad()
+            pred_real = D(torch.cat([black, color], dim=1))
+            d_real_loss = adversarial_loss(pred_real, valid)
+            pred_fake_detach = D(torch.cat([black, fake_color.detach()], dim=1))
+            d_fake_loss = adversarial_loss(pred_fake_detach, fake_label)
+            d_loss = 0.5*(d_real_loss + d_fake_loss)
+            d_loss.backward()
+            opt_D.step()
 
-        # save checkpoint
-        torch.save(G.state_dict(), os.path.join(out_dir, f"g_epoch{epoch}.pth"))
-        torch.save(D.state_dict(), os.path.join(out_dir, f"d_epoch{epoch}.pth"))
+            pbar.set_postfix({'d_loss': d_loss.item(), 'g_loss': g_loss.item(), 'g_l1': g_l1.item()})
 
-        # simple validation: save first val example outputs
-        G.eval()
-        with torch.no_grad():
-            for i, b in enumerate(val_loader):
-                gray = b['gray'].to(device)
-                real = b['color'].to(device)
-                fake = G(gray)
-                save_image((fake+1)/2.0, os.path.join(out_dir, f"val_{epoch}_{i}_fake.png"))
-                save_image((real+1)/2.0, os.path.join(out_dir, f"val_{epoch}_{i}_real.png"))
-                break
+            # save some samples occasionally
+            if i % 200 == 0:
+                # combine black (repeat channel) + fake + real for visualization
+                # denormalize to [0,1]
+                def denorm(x):
+                    return (x * 0.5) + 0.5
+                b = denorm(black.repeat(1,3,1,1))
+                f = denorm(fake_color)
+                r = denorm(color)
+                grid = torch.cat([b, f, r], dim=0)
+                save_image(grid, os.path.join(sample_dir, f'epoch{epoch:03d}_iter{i:04d}.png'), nrow=black.size(0))
 
-    print("Training finished. Models saved to", out_dir)
+        # save checkpoints
+        torch.save({'epoch': epoch, 'G_state': G.state_dict(), 'D_state': D.state_dict(),
+                    'opt_G': opt_G.state_dict(), 'opt_D': opt_D.state_dict()},
+                   os.path.join(ckpt_dir, f'ckpt_epoch_{epoch}.pt'))
 
-if __name__ == '__main__':
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument('--data_dir', required=True)
-    p.add_argument('--epochs', type=int, default=30)
-    p.add_argument('--batch_size', type=int, default=8)
-    p.add_argument('--img_size', type=int, default=256)
-    p.add_argument('--out_dir', default='checkpoints')
-    args = p.parse_args()
-    train(args.data_dir, epochs=args.epochs, batch_size=args.batch_size, img_size=args.img_size, out_dir=args.out_dir)
+if __name__ == "__main__":
+    train(root='Data', epochs=50, batch_size=8, image_size=256)
