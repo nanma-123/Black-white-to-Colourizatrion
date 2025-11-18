@@ -2,70 +2,87 @@
 import torch
 import torch.nn as nn
 
-def conv_block(in_c, out_c, kernel=4, stride=2, padding=1, batchnorm=True):
-    layers = [nn.Conv2d(in_c, out_c, kernel, stride, padding, bias=False)]
+# helper conv blocks
+def conv_block(in_ch, out_ch, kernel_size=4, stride=2, padding=1, batchnorm=True):
+    layers = [nn.Conv2d(in_ch, out_ch, kernel_size, stride, padding, bias=False)]
     if batchnorm:
-        layers.append(nn.BatchNorm2d(out_c))
+        layers.append(nn.BatchNorm2d(out_ch))
     layers.append(nn.LeakyReLU(0.2, inplace=True))
     return nn.Sequential(*layers)
 
-def deconv_block(in_c, out_c, kernel=4, stride=2, padding=1, dropout=False):
-    layers = [nn.ConvTranspose2d(in_c, out_c, kernel, stride, padding, bias=False),
-              nn.BatchNorm2d(out_c),
+def deconv_block(in_ch, out_ch, kernel_size=4, stride=2, padding=1, dropout=0.0):
+    layers = [nn.ConvTranspose2d(in_ch, out_ch, kernel_size, stride, padding, bias=False),
+              nn.BatchNorm2d(out_ch),
               nn.ReLU(inplace=True)]
-    if dropout:
-        layers.append(nn.Dropout(0.5))
+    if dropout>0:
+        layers.append(nn.Dropout(dropout))
     return nn.Sequential(*layers)
 
 class UNetGenerator(nn.Module):
-    def __init__(self, in_channels=3, out_channels=3, features=64):
+    def __init__(self, in_channels=1, out_channels=3, ngf=64):
         super().__init__()
-        self.down1 = nn.Sequential(nn.Conv2d(in_channels, features, 4, 2, 1), nn.LeakyReLU(0.2, True))
-        self.down2 = conv_block(features, features*2)
-        self.down3 = conv_block(features*2, features*4)
-        self.down4 = conv_block(features*4, features*8)
-        self.down5 = conv_block(features*8, features*8)
-        self.down6 = conv_block(features*8, features*8)
-        self.down7 = conv_block(features*8, features*8)
-        self.bottleneck = nn.Sequential(nn.Conv2d(features*8, features*8, 4, 2, 1), nn.ReLU(True))
+        # Encoder
+        self.enc1 = nn.Sequential(nn.Conv2d(in_channels, ngf, 4, 2, 1), nn.LeakyReLU(0.2, True)) # no bn first
+        self.enc2 = conv_block(ngf, ngf*2)
+        self.enc3 = conv_block(ngf*2, ngf*4)
+        self.enc4 = conv_block(ngf*4, ngf*8)
+        self.enc5 = conv_block(ngf*8, ngf*8)
+        self.enc6 = conv_block(ngf*8, ngf*8)
+        self.enc7 = conv_block(ngf*8, ngf*8)
+        self.enc8 = conv_block(ngf*8, ngf*8, batchnorm=False)  # bottleneck
 
-        self.up1 = deconv_block(features*8, features*8, dropout=True)
-        self.up2 = deconv_block(features*8*2, features*8, dropout=True)
-        self.up3 = deconv_block(features*8*2, features*8, dropout=True)
-        self.up4 = deconv_block(features*8*2, features*8)
-        self.up5 = deconv_block(features*8*2, features*4)
-        self.up6 = deconv_block(features*4*2, features*2)
-        self.up7 = deconv_block(features*2*2, features)
-        self.final = nn.Sequential(nn.ConvTranspose2d(features*2, out_channels, 4, 2, 1), nn.Tanh())
+        # Decoder (with skip connections)
+        self.dec1 = deconv_block(ngf*8, ngf*8, dropout=0.5)
+        self.dec2 = deconv_block(ngf*16, ngf*8, dropout=0.5)
+        self.dec3 = deconv_block(ngf*16, ngf*8, dropout=0.5)
+        self.dec4 = deconv_block(ngf*16, ngf*8)
+        self.dec5 = deconv_block(ngf*16, ngf*4)
+        self.dec6 = deconv_block(ngf*8, ngf*2)
+        self.dec7 = deconv_block(ngf*4, ngf)
+        self.dec8 = nn.Sequential(
+            nn.ConvTranspose2d(ngf*2, out_channels, 4, 2, 1),
+            nn.Tanh()
+        )
 
     def forward(self, x):
-        d1 = self.down1(x)
-        d2 = self.down2(d1)
-        d3 = self.down3(d2)
-        d4 = self.down4(d3)
-        d5 = self.down5(d4)
-        d6 = self.down6(d5)
-        d7 = self.down7(d6)
-        bn = self.bottleneck(d7)
-
-        u1 = self.up1(bn); u1 = torch.cat([u1, d7], dim=1)
-        u2 = self.up2(u1); u2 = torch.cat([u2, d6], dim=1)
-        u3 = self.up3(u2); u3 = torch.cat([u3, d5], dim=1)
-        u4 = self.up4(u3); u4 = torch.cat([u4, d4], dim=1)
-        u5 = self.up5(u4); u5 = torch.cat([u5, d3], dim=1)
-        u6 = self.up6(u5); u6 = torch.cat([u6, d2], dim=1)
-        u7 = self.up7(u6); u7 = torch.cat([u7, d1], dim=1)
-        return self.final(u7)
+        e1 = self.enc1(x)
+        e2 = self.enc2(e1)
+        e3 = self.enc3(e2)
+        e4 = self.enc4(e3)
+        e5 = self.enc5(e4)
+        e6 = self.enc6(e5)
+        e7 = self.enc7(e6)
+        e8 = self.enc8(e7)
+        d1 = self.dec1(e8)
+        d1 = torch.cat([d1, e7], dim=1)
+        d2 = self.dec2(d1)
+        d2 = torch.cat([d2, e6], dim=1)
+        d3 = self.dec3(d2)
+        d3 = torch.cat([d3, e5], dim=1)
+        d4 = self.dec4(d3)
+        d4 = torch.cat([d4, e4], dim=1)
+        d5 = self.dec5(d4)
+        d5 = torch.cat([d5, e3], dim=1)
+        d6 = self.dec6(d5)
+        d6 = torch.cat([d6, e2], dim=1)
+        d7 = self.dec7(d6)
+        d7 = torch.cat([d7, e1], dim=1)
+        out = self.dec8(d7)
+        return out
 
 class PatchDiscriminator(nn.Module):
-    def __init__(self, in_channels=6, features=64):
+    def __init__(self, in_channels=4, ndf=64):  # input: grayscale + color
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, features, 4, 2, 1), nn.LeakyReLU(0.2, True),
-            conv_block(features, features*2),
-            conv_block(features*2, features*4),
-            conv_block(features*4, features*8, stride=1, padding=1),
-            nn.Conv2d(features*8, 1, 4, 1, 1)
-        )
+        self.layer1 = nn.Sequential(nn.Conv2d(in_channels, ndf, 4, 2, 1), nn.LeakyReLU(0.2, True))
+        self.layer2 = conv_block(ndf, ndf*2)
+        self.layer3 = conv_block(ndf*2, ndf*4)
+        self.layer4 = conv_block(ndf*4, ndf*8, stride=1, padding=1)  # stride=1 for PatchGAN
+        self.last = nn.Conv2d(ndf*8, 1, 4, 1, 1)  # output patch
+
     def forward(self, x):
-        return self.net(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+        x = self.last(x)
+        return x
